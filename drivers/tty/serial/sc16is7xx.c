@@ -1161,15 +1161,11 @@ static int sc16is7xx_gpio_direction_output(struct gpio_chip *chip,
 {
 	struct sc16is7xx_port *s = gpiochip_get_data(chip);
 	struct uart_port *port = &s->p[0].port;
-	u8 state = sc16is7xx_port_read(port, SC16IS7XX_IOSTATE_REG);
 
-	if (val)
-		state |= BIT(offset);
-	else
-		state &= ~BIT(offset);
-	sc16is7xx_port_write(port, SC16IS7XX_IOSTATE_REG, state);
 	sc16is7xx_port_update(port, SC16IS7XX_IODIR_REG, BIT(offset),
 			      BIT(offset));
+	sc16is7xx_port_update(port, SC16IS7XX_IOSTATE_REG, BIT(offset),
+			      val ? BIT(offset) : 0);
 
 	return 0;
 }
@@ -1260,7 +1256,7 @@ static int sc16is7xx_probe(struct device *dev,
 		s->p[i].port.line	= sc16is7xx_alloc_line();
 		if (s->p[i].port.line >= SC16IS7XX_MAX_DEVS) {
 			ret = -ENOMEM;
-			goto out_ports;
+			goto out_thread;
 		}
 
 		/* Disable all interrupts */
@@ -1294,6 +1290,17 @@ static int sc16is7xx_probe(struct device *dev,
 		sc16is7xx_power(&s->p[i].port, 0);
 	}
 
+	if (dev->of_node) {
+		struct property *prop;
+		const __be32 *p;
+		u32 u;
+
+		of_property_for_each_u32(dev->of_node, "irda-mode-ports",
+					 prop, p, u)
+			if (u < devtype->nr_uart)
+				s->p[u].irda_mode = true;
+	}
+
 #ifdef CONFIG_GPIOLIB
 	if (devtype->nr_gpio) {
 		/* Setup GPIO cotroller */
@@ -1309,20 +1316,9 @@ static int sc16is7xx_probe(struct device *dev,
 		s->gpio.can_sleep	 = 1;
 		ret = gpiochip_add_data(&s->gpio, s);
 		if (ret)
-			goto out_thread;
+			goto out_ports;
 	}
 #endif
-
-	if (dev->of_node) {
-		struct property *prop;
-		const __be32 *p;
-		u32 u;
-
-		of_property_for_each_u32(dev->of_node, "irda-mode-ports",
-					 prop, p, u)
-			if (u < devtype->nr_uart)
-				s->p[u].irda_mode = true;
-	}
 
 	/*
 	 * Setup interrupt. We first try to acquire the IRQ line as level IRQ.
@@ -1343,18 +1339,18 @@ static int sc16is7xx_probe(struct device *dev,
 	if (!ret)
 		return 0;
 
+#ifdef CONFIG_GPIOLIB
+	if (devtype->nr_gpio)
+		gpiochip_remove(&s->gpio);
+
 out_ports:
+#endif
 	for (i--; i >= 0; i--) {
 		uart_remove_one_port(&sc16is7xx_uart, &s->p[i].port);
 		clear_bit(s->p[i].port.line, &sc16is7xx_lines);
 	}
 
-#ifdef CONFIG_GPIOLIB
-	if (devtype->nr_gpio)
-		gpiochip_remove(&s->gpio);
-
 out_thread:
-#endif
 	kthread_stop(s->kworker_task);
 
 out_clk:
