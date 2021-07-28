@@ -15,6 +15,7 @@ menuconfig NINTENDO3DS_PLATFORM_DEVICES
 
 if NINTENDO3DS_PLATFORM_DEVICES
 
+
 config CTR_GPIO
 	tristate "Nintendo 3DS GPIO driver"
 	select GPIOLIB
@@ -22,23 +23,51 @@ config CTR_GPIO
 	select GPIOLIB_IRQCHIP
 	default y
 	help
-	  Allows controlling the GPIO bits and can
-	  act as an interrupt controller.
+	  Allows controlling the GPIO bits and can act
+	  as an interrupt controller.
 
-config CTR_SDHC
+	  Used by pretty much everything in the 3DS, so enable it.
+
+
+config CTR_SDHC_MMIO
 	tristate "Nintendo 3DS SD Host Controller"
 	select MMC
 	default y
 	help
-	  Add support for driving the 3DS SD Host Controller.
-	  Note: the controller is only used for the wireless chip.
+	  Add support for driving the 3DS SD Host Controller,
+	  used by external SD card slot and wireless chipset.
+
 
 config CTR_PXI
-	tristate "Nintendo 3DS VirtIO bridge"
-	select VIRTIO
+	tristate "Nintendo 3DS PXI ARM9 bridge"
 	default y
 	help
-	  TODO
+	  Add support for controlling peripherals connected
+	  only to the ARM9 bus.
+
+	  Also acts as an interrupt controller bridge of sorts,
+	  allowing ARM9-specific drivers to be interrupt triggered.
+
+config CTR_PRNG
+	tristate "Nintendo 3DS pseudo-RNG driver"
+	depends on CTR_PXI
+	select HW_RANDOM
+	default y
+	help
+	  Add support for using the built-in hardware pseudo-random
+	  number generator. As an ARM9 peripheral, it needs PXI.
+
+config CTR_SDHC_PXI
+	tristate "Nintendo 3DS SD Host Controller (over PXI)"
+	depends on CTR_PXI
+	select MMC
+	default y
+	help
+	  Add support for driving the eMMC Host Controller.
+	  It's the same as the regular SD Host Controller,
+	  but operations are performed via PXI, as it is
+	  attached only to the ARM9.
+
 
 config CTR_SPI
 	tristate "Nintendo 3DS SPI driver"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /dts-v1/;
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/input/input.h>
@@ -25,6 +26,17 @@
 		compatible = "simple-bus";
 
 		interrupt-parent = <&gic>;
+
+		sdcard: sdhc-controller@10100000 {
+			compatible = "nintendo,3ds-sdhc";
+			reg = <0x10100000 0x200>;
+
+			interrupts =
+				<GIC_SPI 0x22 IRQ_TYPE_EDGE_RISING>,
+				<GIC_SPI 0x23 IRQ_TYPE_EDGE_RISING>;
+
+			clocks = <&sdclk>;
+		};
 
 		/* Main syscon blocks */
 		cfg: syscon@10140000 {
@@ -58,9 +70,6 @@
 				<GIC_SPI 0x21 IRQ_TYPE_EDGE_RISING>;
 
 			clocks = <&sdclk>;
-
-			cap-sdio-irq;
-			cap-sd-highspeed;
 		};
 
 		gpio0: gpio-controller@10147000 {
@@ -307,7 +316,7 @@
 			};
 		};
 
-		pxi: virtio-bridge@10163000 {
+		pxi: pxi-bridge@10163000 {
 			compatible = "nintendo,3ds-pxi";
 			reg = <0x10163000 0x10>;
 
@@ -315,6 +324,13 @@
 				<GIC_SPI 0x30 IRQ_TYPE_EDGE_RISING>,
 				<GIC_SPI 0x32 IRQ_TYPE_EDGE_RISING>,
 				<GIC_SPI 0x33 IRQ_TYPE_EDGE_RISING>;
+
+			interrupt-controller;
+			#interrupt-cells = <1>;
+
+			prng: prng@10011000 {
+				compatible = "nintendo,3ds-prng";
+			};
 		};
 
 		timer: twd-timer@17e00600 {

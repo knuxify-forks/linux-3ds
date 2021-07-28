@@ -7,8 +7,8 @@
  *  Based on toshsd.c, copyright (C) 2014 Ondrej Zary and 2007 Richard Betts
  */
 
-#define DRIVER_NAME "3ds-sdhc"
-#define pr_fmt(fmt) DRIVER_NAME ": " fmt
+//#define DRIVER_NAME "3ds-sdhc"
+//#define pr_fmt(fmt) DRIVER_NAME ": " fmt
 
 #include <linux/io.h>
 #include <linux/of.h>
@@ -27,6 +27,26 @@
 
 #include "ctr_sdhc.h"
 
+static u16 ctr_sdhc_reg16_get(struct ctr_sdhc *host, unsigned off);
+static void ctr_sdhc_reg16_set(struct ctr_sdhc *host, unsigned off, u16 val);
+static u32 ctr_sdhc_reg32_get(struct ctr_sdhc *host, unsigned off);
+static void ctr_sdhc_reg32_set(struct ctr_sdhc *host, unsigned off, u32 val);
+
+static void ctr_sdhc_reset(struct ctr_sdhc *host, u32 default_irqmask);
+static void ctr_sdhc_set_clk_opt(struct ctr_sdhc *host, u16 clk, u16 opt);
+
+static void ctr_sdhc_send_cmdarg(struct ctr_sdhc *host, u16 cmd, u32 arg);
+static void ctr_sdhc_set_blk_len_cnt(struct ctr_sdhc *host, u16 len, u16 cnt);
+static void ctr_sdhc_get_resp(struct ctr_sdhc *host, u32 *resp, unsigned nword);
+static void ctr_sdhc_stop_internal_set(struct ctr_sdhc *host, u16 val);
+
+static u32 ctr_sdhc_irqstat_get(struct ctr_sdhc *host);
+static void ctr_sdhc_irqstat_ack(struct ctr_sdhc *host, u32 ack);
+static void ctr_sdhc_irqmask_set(struct ctr_sdhc *host, u32 mask);
+
+static int ctr_sdhc_sdioirq_test(struct ctr_sdhc *host);
+static void ctr_sdhc_sdioirq_set(struct ctr_sdhc *host, int enable);
+
 #define SDHC_ERR_MASK                                                          \
 	(SDHC_ERR_BAD_CMD | SDHC_ERR_CRC_FAIL | SDHC_ERR_STOP_BIT |            \
 	 SDHC_ERR_DATATIMEOUT | SDHC_ERR_TX_OVERFLOW | SDHC_ERR_RX_UNDERRUN |  \
@@ -37,88 +57,50 @@
 	 SDHC_STAT_TX_REQUEST | SDHC_STAT_CARDREMOVE | SDHC_STAT_CARDINSERT |  \
 	 SDHC_ERR_MASK)
 
-static void ctr_sdhc_reset(struct ctr_sdhc *host)
-{
-	/* reset controller */
-	iowrite16(0, host->regs + SDHC_SOFTRESET);
-	iowrite16(1, host->regs + SDHC_SOFTRESET);
-
-	/* clear registers */
-	iowrite16(0, host->regs + SDHC_CARD_PORTSEL);
-	iowrite16(0, host->regs + SDHC_CARD_CLKCTL);
-	iowrite32(0, host->regs + SDHC_ERROR_STATUS);
-	iowrite16(0, host->regs + SDHC_STOP_INTERNAL);
-
-	iowrite16(0, host->regs + SDHC_DATA16_BLK_CNT);
-	iowrite16(0, host->regs + SDHC_DATA16_BLK_LEN);
-
-	iowrite16(0, host->regs + SDHC_DATA32_BLK_CNT);
-	iowrite16(0, host->regs + SDHC_DATA32_BLK_LEN);
-
-	/* use the 16bit FIFO at all times */
-	iowrite16(0, host->regs + SDHC_DATA_CTL);
-	iowrite16(0, host->regs + SDHC_DATA32_CTL);
-
-	/* set interrupt masks */
-	iowrite32(~SDHC_DEFAULT_IRQMASK, host->regs + SDHC_IRQ_MASK);
-	iowrite32(0, host->regs + SDHC_IRQ_STAT);
-
-	iowrite16(SDHC_CARD_OPTION_1BIT | SDHC_CARD_OPTION_NOC2,
-		  host->regs + SDHC_CARD_OPTION);
-}
-
 static void __ctr_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 {
+	u16 clk_ctl, card_opt;
 	struct ctr_sdhc *host = mmc_priv(mmc);
 
-	switch (ios->power_mode) {
-	case MMC_POWER_OFF:
-		mdelay(1);
-		iowrite16(0, host->regs + SDHC_CARD_CLKCTL);
-		return;
-	case MMC_POWER_UP:
-		break;
-	case MMC_POWER_ON:
-		mdelay(20);
-		break;
-	}
-
 	if (ios->clock) {
-		u16 clk_ctl;
 		int clk_div = -1;
 		unsigned clk_fit = clk_get_rate(host->sdclk) / 2;
 
+		/* get the divider that best achieves the desired clkrate */
 		while ((ios->clock < clk_fit) && (clk_div < 7)) {
 			clk_div++;
 			clk_fit >>= 1;
 		}
 
-		clk_ctl = BIT(clk_div + 2) >> 2;
-		clk_ctl |= SDHC_CARD_CLKCTL_PIN_ENABLE;
-		iowrite16(clk_ctl, host->regs + SDHC_CARD_CLKCTL);
-		mdelay(5);
+		clk_ctl = (BIT(clk_div + 2) >> 2) | SDHC_CARD_CLKCTL_PIN_ENABLE;
 	} else {
-		iowrite16(0, host->regs + SDHC_CARD_CLKCTL);
+		clk_ctl = 0;
 	}
+
+	card_opt = SDHC_CARD_OPTION_RETRIES(14) |
+		   SDHC_CARD_OPTION_TIMEOUT(14) |
+		   SDHC_CARD_OPTION_NOC2;
 
 	switch (ios->bus_width) {
 	default:
 		dev_err(host->dev, "invalid bus width %d\n", ios->bus_width);
-		break;
-
+		return;
 	case MMC_BUS_WIDTH_1:
-		iowrite16(SDHC_CARD_OPTION_RETRIES(14) |
-				  SDHC_CARD_OPTION_TIMEOUT(14) |
-				  SDHC_CARD_OPTION_NOC2 | SDHC_CARD_OPTION_1BIT,
-			  host->regs + SDHC_CARD_OPTION);
+		card_opt |= SDHC_CARD_OPTION_1BIT;
 		break;
 	case MMC_BUS_WIDTH_4:
-		iowrite16(SDHC_CARD_OPTION_RETRIES(14) |
-				  SDHC_CARD_OPTION_TIMEOUT(14) |
-				  SDHC_CARD_OPTION_NOC2 | SDHC_CARD_OPTION_4BIT,
-			  host->regs + SDHC_CARD_OPTION);
+		card_opt |= SDHC_CARD_OPTION_4BIT;
 		break;
 	}
+
+	if (ios->power_mode == MMC_POWER_OFF)
+		clk_ctl = 0; /* force-disable clock */
+
+	/* set the desired clock divider and card option config */
+	ctr_sdhc_set_clk_opt(host, clk_ctl, card_opt);
+
+	/* wait a bit */
+	mdelay(20);
 }
 
 static void ctr_sdhc_finish_request(struct ctr_sdhc *host)
@@ -202,8 +184,8 @@ done:
 
 static void ctr_sdhc_respend_irq(struct ctr_sdhc *host)
 {
+	u32 response[4], *respbuf;
 	struct mmc_command *cmd = host->cmd;
-	u32 response[4], *respbuf, i, reg;
 
 	if (!host->cmd) {
 		dev_err(host->dev, "Spurious CMD irq\n");
@@ -213,8 +195,7 @@ static void ctr_sdhc_respend_irq(struct ctr_sdhc *host)
 	respbuf = (u32*)cmd->resp;
 	host->cmd = NULL;
 
-	for (i = 0, reg = SDHC_CMD_RESPONSE; i < 4; i++, reg += 4)
-		response[i] = ioread32(host->regs + reg);
+	ctr_sdhc_get_resp(host, response, 4);
 
 	if (cmd->flags & MMC_RSP_PRESENT && cmd->flags & MMC_RSP_136) {
 		respbuf[0] = (response[3] << 8) | (response[2] >> 24);
@@ -239,14 +220,13 @@ static void ctr_sdhc_respend_irq(struct ctr_sdhc *host)
 static irqreturn_t ctr_sdhc_irq(int irq, void *dev_id)
 {
 	struct ctr_sdhc *host = dev_id;
-	u32 int_reg, int_data;
+	u32 int_reg;
+
 	int error = 0, ret = IRQ_HANDLED;
 
 	spin_lock(&host->lock);
 
-	int_reg = ioread32(host->regs + SDHC_IRQ_STAT);
-	int_data = ioread16(host->regs + SDHC_DATA32_CTL);
-
+	int_reg = ctr_sdhc_irqstat_get(host);
 	dev_dbg(host->dev, "IRQ status: %x\n", int_reg);
 
 	if (!int_reg) {
@@ -254,12 +234,11 @@ static irqreturn_t ctr_sdhc_irq(int irq, void *dev_id)
 		goto irq_end;
 	}
 
-	iowrite32(~(int_reg & SDHC_DEFAULT_IRQMASK),
-		  host->regs + SDHC_IRQ_STAT);
+	ctr_sdhc_irqstat_ack(host, int_reg & SDHC_DEFAULT_IRQMASK);
 
 	if (int_reg & (SDHC_STAT_CARDREMOVE | SDHC_STAT_CARDINSERT)) {
 		if (int_reg & SDHC_STAT_CARDPRESENT)
-			ctr_sdhc_reset(host);
+			ctr_sdhc_reset(host, SDHC_DEFAULT_IRQMASK);
 		mmc_detect_change(host->mmc, 1);
 	}
 
@@ -270,8 +249,8 @@ static irqreturn_t ctr_sdhc_irq(int irq, void *dev_id)
 	} else if (int_reg & SDHC_ERR_MASK) {
 		dev_err(host->dev, "buffer error: %08X\n",
 			int_reg & SDHC_ERR_MASK);
-		dev_err(host->dev, "detail error status %08X\n",
-			ioread32(host->regs + SDHC_ERROR_STATUS));
+		/*dev_err(host->dev, "detail error status %08X\n",
+			ioread32(host->regs + SDHC_ERROR_STATUS));*/
 		error = -EIO;
 	}
 
@@ -280,7 +259,7 @@ static irqreturn_t ctr_sdhc_irq(int irq, void *dev_id)
 			host->cmd->error = error;
 
 		if (error != -ETIMEDOUT) {
-			ctr_sdhc_reset(host);
+			ctr_sdhc_reset(host, SDHC_DEFAULT_IRQMASK);
 			__ctr_sdhc_set_ios(host->mmc, &host->mmc->ios);
 			goto irq_end;
 		}
@@ -305,9 +284,7 @@ irq_end:
 static irqreturn_t ctr_sdhc_sdio_irq(int irq, void *data)
 {
 	struct ctr_sdhc *host = data;
-	u32 mask = ioread16(host->regs + SDHC_CARD_IRQ_STAT) & BIT(0);
-	iowrite16(~mask, host->regs + SDHC_CARD_IRQ_STAT);
-	if (mask) {
+	if (ctr_sdhc_sdioirq_test(host)) {
 		mmc_signal_sdio_irq(host->mmc);
 		return IRQ_HANDLED;
 	}
@@ -322,8 +299,7 @@ static void ctr_sdhc_start_cmd(struct ctr_sdhc *host, struct mmc_command *cmd)
 	dev_dbg(host->dev, "Command opcode: %d\n", cmd->opcode);
 
 	if (cmd->opcode == MMC_STOP_TRANSMISSION) {
-		iowrite16(SDHC_STOP_INTERNAL_ISSUE,
-			  host->regs + SDHC_STOP_INTERNAL);
+		ctr_sdhc_stop_internal_set(host, SDHC_STOP_INTERNAL_ISSUE);
 
 		cmd->resp[0] = cmd->opcode;
 		cmd->resp[1] = 0;
@@ -375,19 +351,18 @@ static void ctr_sdhc_start_cmd(struct ctr_sdhc *host, struct mmc_command *cmd)
 		c |= SDHC_CMD_DATA_XFER;
 
 		if (data->blocks > 0) {
-			iowrite16(SDHC_STOP_INTERNAL_ENABLE,
-				  host->regs + SDHC_STOP_INTERNAL);
+			ctr_sdhc_stop_internal_set(host,
+				SDHC_STOP_INTERNAL_ENABLE);
 			c |= SDHC_CMD_DATA_MULTI;
 		} else {
-			iowrite16(0, host->regs + SDHC_STOP_INTERNAL);
+			ctr_sdhc_stop_internal_set(host, 0);
 		}
 
 		if (data->flags & MMC_DATA_READ)
 			c |= SDHC_CMD_DATA_READ;
 	}
 
-	iowrite32(cmd->arg, host->regs + SDHC_CMD_PARAM);
-	iowrite16(c, host->regs + SDHC_CMD);
+	ctr_sdhc_send_cmdarg(host, c, cmd->arg);
 }
 
 static void ctr_sdhc_start_data(struct ctr_sdhc *host, struct mmc_data *data)
@@ -408,8 +383,7 @@ static void ctr_sdhc_start_data(struct ctr_sdhc *host, struct mmc_data *data)
 
 	sg_miter_start(&host->sg_miter, data->sg, data->sg_len, flags);
 
-	iowrite16(data->blksz, host->regs + SDHC_DATA16_BLK_LEN);
-	iowrite16(data->blocks, host->regs + SDHC_DATA16_BLK_CNT);
+	ctr_sdhc_set_blk_len_cnt(host, data->blksz, data->blocks);
 }
 
 /* Process requests from the MMC layer */
@@ -451,26 +425,20 @@ static void ctr_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 static int ctr_sdhc_get_ro(struct mmc_host *mmc)
 {
 	struct ctr_sdhc *host = mmc_priv(mmc);
-	return !(ioread16(host->regs + SDHC_IRQ_STAT) & SDHC_STAT_WRITEPROT);
+	return !(ctr_sdhc_irqstat_get(host) & SDHC_STAT_WRITEPROT);
 }
 
 static int ctr_sdhc_get_cd(struct mmc_host *mmc)
 {
 	struct ctr_sdhc *host = mmc_priv(mmc);
-	return !!(ioread16(host->regs + SDHC_IRQ_STAT) & SDHC_STAT_CARDPRESENT);
+	return !!(ctr_sdhc_irqstat_get(host) & SDHC_STAT_CARDPRESENT);
 }
 
 static void ctr_sdhc_enable_sdio_irq(struct mmc_host *mmc, int enable)
 {
 	struct ctr_sdhc *host = mmc_priv(mmc);
 	pr_err("ctr_sdhc_enable_sdio_irq %d\n", enable);
-	if (enable) {
-		iowrite16(1, host->regs + SDHC_CARD_IRQ_CTL);
-		iowrite16(~1, host->regs + SDHC_CARD_IRQ_MASK);
-	} else {
-		iowrite16(0, host->regs + SDHC_CARD_IRQ_CTL);
-		iowrite16(~0, host->regs + SDHC_CARD_IRQ_MASK);
-	}
+	ctr_sdhc_sdioirq_set(host, enable);
 }
 
 static const struct mmc_host_ops ctr_sdhc_ops = {
@@ -485,15 +453,15 @@ static const struct mmc_host_ops ctr_sdhc_ops = {
 static int ctr_sdhc_pm_suspend(struct device *dev)
 {
 	struct ctr_sdhc *host = dev_get_drvdata(dev);
-	iowrite32(~0, host->regs + SDHC_IRQ_MASK);
-	iowrite16(0, host->regs + SDHC_CARD_CLKCTL);
+	ctr_sdhc_irqmask_set(host, ~0);
+	ctr_sdhc_set_clk_opt(host, 0, SDHC_CARD_OPTION_1BIT);
 	return 0;
 }
 
 static int ctr_sdhc_pm_resume(struct device *dev)
 {
 	struct ctr_sdhc *host = dev_get_drvdata(dev);
-	ctr_sdhc_reset(host);
+	ctr_sdhc_reset(host, SDHC_DEFAULT_IRQMASK);
 	return 0;
 }
 #endif /* CONFIG_PM_SLEEP */
@@ -536,17 +504,18 @@ static int ctr_sdhc_probe(struct platform_device *pdev)
 	}
 
 	mmc->ops = &ctr_sdhc_ops;
-	mmc->caps = MMC_CAP_4_BIT_DATA | MMC_CAP_SDIO_IRQ;
+	mmc->caps = MMC_CAP_4_BIT_DATA | MMC_CAP_MMC_HIGHSPEED |
+		    MMC_CAP_SD_HIGHSPEED | MMC_CAP_SDIO_IRQ;
 	mmc->ocr_avail = MMC_VDD_32_33;
 	mmc->max_blk_size = 0x200;
 	mmc->max_blk_count = 0xFFFF;
 
-	mmc->f_min = clkrate / 512;
-	mmc->f_max = clkrate / 2;
+	mmc->f_min = clkrate >> 9;
+	mmc->f_max = clkrate >> 1;
 
 	spin_lock_init(&host->lock);
 
-	ctr_sdhc_reset(host);
+	ctr_sdhc_reset(host, SDHC_DEFAULT_IRQMASK);
 
 	ret = devm_request_threaded_irq(dev, platform_get_irq(pdev, 0),
 					ctr_sdhc_irq, ctr_sdhc_thread_irq,
@@ -568,8 +537,14 @@ free_mmc:
 	return ret;
 }
 
-static const struct dev_pm_ops ctr_sdhc_pm_ops = { SET_SYSTEM_SLEEP_PM_OPS(
-	ctr_sdhc_pm_suspend, ctr_sdhc_pm_resume) };
+static int ctr_sdhc_remove(struct platform_device *pdev)
+{
+	return -EBUSY;
+}
+
+static const struct dev_pm_ops ctr_sdhc_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(ctr_sdhc_pm_suspend, ctr_sdhc_pm_resume)
+};
 
 static const struct of_device_id ctr_sdhc_of_match[] = {
 	{ .compatible = "nintendo," DRIVER_NAME },
@@ -579,11 +554,14 @@ MODULE_DEVICE_TABLE(of, ctr_sdhc_of_match);
 
 static struct platform_driver ctr_sdhc_driver = {
 	.probe = ctr_sdhc_probe,
+	.remove = ctr_sdhc_remove,
 
-	.driver = { .name = DRIVER_NAME,
-		    .owner = THIS_MODULE,
-		    .of_match_table = of_match_ptr(ctr_sdhc_of_match),
-		    .pm = &ctr_sdhc_pm_ops },
+	.driver = {
+		.name = DRIVER_NAME,
+		.owner = THIS_MODULE,
+		.of_match_table = of_match_ptr(ctr_sdhc_of_match),
+		.pm = &ctr_sdhc_pm_ops
+	},
 };
 
 module_platform_driver(ctr_sdhc_driver);

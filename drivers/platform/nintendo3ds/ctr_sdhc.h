@@ -5,6 +5,9 @@
  *  Copyright (C) 2021 Santiago Herrera
  */
 
+#ifndef CTR_SDHC_H
+#define CTR_SDHC_H
+
 /*
  * SD CMD flags
  */
@@ -143,3 +146,5 @@ struct ctr_sdhc {
 
 	struct sg_mapping_iter sg_miter;
 };
+
+#endif /* CTR_SDHC_H */
