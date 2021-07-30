@@ -6,6 +6,8 @@
  */
 
 /** PXI Interrupt controller functions */
+#define CTR_PXI_NR_IRQS	32
+
 static irqreturn_t pxi_sync_thread(int irq, void *data)
 {
 	int err;
@@ -17,29 +19,31 @@ static irqreturn_t pxi_sync_thread(int irq, void *data)
 		CTR_PXI_CMD(CTR_PXI_IRQGET, 0, 0);
 
 	mutex_lock(&pxi->irq_lock);
-	do {
+	do { /* keep requesting the highest priority IRQ until there's none */
 		err = pxi_cmd_one(pxi, ctr_pxi_cmd_irqget, &pend);
 
-		if (pend >= 32)
+		if (pend >= CTR_PXI_NR_IRQS)
 			break;
 
 		ret = IRQ_HANDLED;
-		handle_nested_irq(irq_find_mapping(pxi->irqdom, pend));
+		generic_handle_irq(irq_find_mapping(pxi->irqdom, pend));
 	} while(1);
 	mutex_unlock(&pxi->irq_lock);
 
 	return ret;
 }
 
-static void ctr_pxi_irqc_irq_toggle(struct irq_data *data, u32 mode)
+static void ctr_pxi_irqc_irq_toggle(struct irq_data *data, u32 cmd)
 {
 	int err;
 
 	struct irq_chip_generic *irqgc = irq_data_get_irq_chip_data(data);
 	struct ctr_pxi_host *pxi = irqgc->private;
 
-	err = pxi_cmd_one(pxi, CTR_PXI_CMD(mode, 0, data->hwirq), NULL);
+	mutex_lock(&pxi->irq_lock);
+	err = pxi_cmd_one(pxi, CTR_PXI_CMD(cmd, 0, data->hwirq), NULL);
 	WARN_ON(err);
+	mutex_unlock(&pxi->irq_lock);
 }
 
 static void ctr_pxi_irqc_irq_mask(struct irq_data *data)
@@ -58,16 +62,16 @@ static int ctr_pxi_irqc_init(struct ctr_pxi_host *pxi)
 	struct irq_chip_type *ct;
 	struct device *dev = pxi->dev;
 
-	irq_base = devm_irq_alloc_descs(dev, -1, 0, 32, 0);
+	irq_base = devm_irq_alloc_descs(dev, -1, 0, CTR_PXI_NR_IRQS, 0);
 	if (irq_base < 0)
 		return irq_base;
 
-	pxi->irqdom = irq_domain_add_linear(dev->of_node, 32,
+	pxi->irqdom = irq_domain_add_linear(dev->of_node, CTR_PXI_NR_IRQS,
 					    &irq_domain_simple_ops, pxi);
 	if (!pxi->irqdom)
 		return -ENXIO;
 
-	irq_domain_associate_many(pxi->irqdom, irq_base, 0, 32);
+	irq_domain_associate_many(pxi->irqdom, irq_base, 0, CTR_PXI_NR_IRQS);
 
 	pxi->irqgc = devm_irq_alloc_generic_chip(dev, dev_name(dev), 1,
 						 irq_base, NULL,
@@ -83,10 +87,13 @@ static int ctr_pxi_irqc_init(struct ctr_pxi_host *pxi)
 	ct->chip.irq_mask = ctr_pxi_irqc_irq_mask;
 	ct->chip.irq_unmask = ctr_pxi_irqc_irq_unmask;
 
-	err = devm_irq_setup_generic_chip(dev, pxi->irqgc, IRQ_MSK(32),
-					  0, 0, 0);
-	if (err < 0) {
+	err = devm_irq_setup_generic_chip(dev, pxi->irqgc,
+					  IRQ_MSK(CTR_PXI_NR_IRQS), 0,
+					  IRQF_SHARED | IRQF_NO_THREAD,
+					  IRQF_ONESHOT);
+
 	remove_irqdom:
+	if (err < 0) {
 		irq_domain_remove(pxi->irqdom);
 		return err;
 	}

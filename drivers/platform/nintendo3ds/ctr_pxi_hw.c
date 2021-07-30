@@ -5,7 +5,7 @@
  *  Copyright (C) 2021 Santiago Herrera
  */
 
-/* Main driver code, incorporates the rest of the source */
+/* Main driver code, incorporates the rest of the source via #include */
 
 #define DRIVER_NAME "3ds-pxi"
 #define pr_fmt(str) DRIVER_NAME ": " str
@@ -101,11 +101,6 @@ static int pxi_rx_one(struct ctr_pxi_host *pxi, u32 *data)
 #include "ctr_pxi.c"	/* Main transport layer and device management */
 #include "ctr_pxi_irqc.c"	/* IRQ Controller */
 
-static irqreturn_t pxi_sync_irq(int irq, void *data)
-{
-	return IRQ_WAKE_THREAD;
-}
-
 static irqreturn_t pxi_fifo_irq(int irq, void *data)
 {
 	struct ctr_pxi_host *pxi = data;
@@ -176,8 +171,8 @@ static int ctr_pxi_probe(struct platform_device *pdev)
 	if (err) return err;
 
 	/* request the sync and fifo interrupts */
-	err = devm_request_threaded_irq(dev, sync_irq, pxi_sync_irq,
-					pxi_sync_thread, 0, "pxi_sync", pxi);
+	err = devm_request_threaded_irq(dev, sync_irq, NULL, pxi_sync_thread,
+					IRQF_ONESHOT, "pxi_sync", pxi);
 	if (err) return err;
 
 	err = devm_request_irq(dev, tx_irq, pxi_fifo_irq, 0, "pxi_tx", pxi);

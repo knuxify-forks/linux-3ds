@@ -14,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
+#include <linux/mutex.h>
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/mmc/mmc.h>
@@ -27,40 +28,25 @@
 
 #include "ctr_sdhc.h"
 
-static u16 ctr_sdhc_reg16_get(struct ctr_sdhc *host, unsigned off);
-static void ctr_sdhc_reg16_set(struct ctr_sdhc *host, unsigned off, u16 val);
-static u32 ctr_sdhc_reg32_get(struct ctr_sdhc *host, unsigned off);
-static void ctr_sdhc_reg32_set(struct ctr_sdhc *host, unsigned off, u32 val);
-
-static void ctr_sdhc_reset(struct ctr_sdhc *host, u32 default_irqmask);
-static void ctr_sdhc_set_clk_opt(struct ctr_sdhc *host, u16 clk, u16 opt);
-
-static void ctr_sdhc_send_cmdarg(struct ctr_sdhc *host, u16 cmd, u32 arg);
-static void ctr_sdhc_set_blk_len_cnt(struct ctr_sdhc *host, u16 len, u16 cnt);
-static void ctr_sdhc_get_resp(struct ctr_sdhc *host, u32 *resp, unsigned nword);
-static void ctr_sdhc_stop_internal_set(struct ctr_sdhc *host, u16 val);
-
-static u32 ctr_sdhc_irqstat_get(struct ctr_sdhc *host);
-static void ctr_sdhc_irqstat_ack(struct ctr_sdhc *host, u32 ack);
-static void ctr_sdhc_irqmask_set(struct ctr_sdhc *host, u32 mask);
-
-static int ctr_sdhc_sdioirq_test(struct ctr_sdhc *host);
-static void ctr_sdhc_sdioirq_set(struct ctr_sdhc *host, int enable);
-
 #define SDHC_ERR_MASK                                                          \
 	(SDHC_ERR_BAD_CMD | SDHC_ERR_CRC_FAIL | SDHC_ERR_STOP_BIT |            \
 	 SDHC_ERR_DATATIMEOUT | SDHC_ERR_TX_OVERFLOW | SDHC_ERR_RX_UNDERRUN |  \
 	 SDHC_ERR_CMD_TIMEOUT | SDHC_ERR_ILLEGAL_ACC)
 
-#define SDHC_DEFAULT_IRQMASK                                                   \
+#define SDHC_IRQMASK                                                   \
 	(SDHC_STAT_CMDRESPEND | SDHC_STAT_DATA_END | SDHC_STAT_RX_READY |      \
 	 SDHC_STAT_TX_REQUEST | SDHC_STAT_CARDREMOVE | SDHC_STAT_CARDINSERT |  \
 	 SDHC_ERR_MASK)
 
-static void __ctr_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
+#define SDHC_DEFAULT_CARDOPT	( \
+	SDHC_CARD_OPTION_RETRIES(14) | \
+	SDHC_CARD_OPTION_TIMEOUT(14) | \
+	SDHC_CARD_OPTION_NOC2 \
+)
+
+static void __ctr_sdhc_set_ios(struct ctr_sdhc *host, struct mmc_ios *ios)
 {
 	u16 clk_ctl, card_opt;
-	struct ctr_sdhc *host = mmc_priv(mmc);
 
 	if (ios->clock) {
 		int clk_div = -1;
@@ -72,14 +58,13 @@ static void __ctr_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 			clk_fit >>= 1;
 		}
 
-		clk_ctl = (BIT(clk_div + 2) >> 2) | SDHC_CARD_CLKCTL_PIN_ENABLE;
+		clk_ctl = (BIT(clk_div + 2) >> 2);
+		clk_ctl |= SDHC_CARD_CLKCTL_PIN_ENABLE;
 	} else {
 		clk_ctl = 0;
 	}
 
-	card_opt = SDHC_CARD_OPTION_RETRIES(14) |
-		   SDHC_CARD_OPTION_TIMEOUT(14) |
-		   SDHC_CARD_OPTION_NOC2;
+	card_opt = SDHC_DEFAULT_CARDOPT;
 
 	switch (ios->bus_width) {
 	default:
@@ -100,25 +85,29 @@ static void __ctr_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	ctr_sdhc_set_clk_opt(host, clk_ctl, card_opt);
 
 	/* wait a bit */
-	mdelay(20);
+	mdelay(10);
 }
 
-static void ctr_sdhc_finish_request(struct ctr_sdhc *host)
+static void ctr_sdhc_finish_request(struct ctr_sdhc *host, int err)
 {
 	struct mmc_request *mrq = host->mrq;
 
-	host->mrq = NULL;
-	host->cmd = NULL;
-	host->data = NULL;
+	if (!mrq)
+		return; /* nothing to do if there's no active request */
 
+	if (err < 0 && mrq->cmd)
+		mrq->cmd->error = err;
+
+	host->mrq = NULL;
 	mmc_request_done(host->mmc, mrq);
 }
 
-static void ctr_sdhc_data_end_irq(struct ctr_sdhc *host)
+static void ctr_sdhc_dataend_irq(struct ctr_sdhc *host, u32 irqstat)
 {
-	struct mmc_data *data = host->data;
+	struct mmc_data *data = host->mrq->data;
 
-	host->data = NULL;
+	if (!(irqstat & SDHC_STAT_DATA_END))
+		return;
 
 	if (!data) {
 		dev_warn(host->dev, "Spurious data end IRQ\n");
@@ -133,38 +122,47 @@ static void ctr_sdhc_data_end_irq(struct ctr_sdhc *host)
 	dev_dbg(host->dev, "Completed data request xfr=%d\n",
 		data->bytes_xfered);
 
-	ctr_sdhc_finish_request(host);
+	ctr_sdhc_stop_internal_set(host, 0);
+	ctr_sdhc_finish_request(host, data->error);
 }
 
-static irqreturn_t ctr_sdhc_thread_irq(int irq, void *dev_id)
+static void ctr_sdhc_data_irq(struct ctr_sdhc *host, u32 irqstat)
 {
-	struct ctr_sdhc *host = dev_id;
-	struct mmc_data *data = host->data;
-	struct sg_mapping_iter *sg_miter = &host->sg_miter;
 	u8 *buf;
 	int count;
-	unsigned long flags;
+	struct mmc_data *data;
+	struct sg_mapping_iter *sg_miter;
+
+	u32 mask = irqstat & (SDHC_STAT_RX_READY | SDHC_STAT_TX_REQUEST);
+	if (!mask)
+		return;
+
+	/* data available to be sent or received */
+	data = host->mrq->data;
+	sg_miter = &host->sg_miter;
 
 	if (!data) {
-		dev_warn(host->dev, "Spurious Data IRQ\n");
-		if (host->cmd) {
-			host->cmd->error = -EIO;
-			ctr_sdhc_finish_request(host);
-		}
-		return IRQ_NONE;
+		dev_err(host->dev,
+			"spurious data IRQ: request carries no data\n");
+		/* break out with an IO error in case there's
+		 * a FIFO interrupt without a data transfer */
+		data->error = -EIO;
+		ctr_sdhc_finish_request(host, -EIO);
+		return;
 	}
-	spin_lock_irqsave(&host->lock, flags);
 
-	if (!sg_miter_next(sg_miter))
-		goto done;
+	/* no pending blocks, warn out */
+	if (!sg_miter_next(sg_miter)) {
+		dev_err(host->dev, "spurious data IRQ: no pending blocks\n");
+		return;
+	}
 
 	buf = sg_miter->addr;
 
+	/* always read one block at a time at most */
 	count = sg_miter->length;
 	if (count > data->blksz)
 		count = data->blksz;
-
-	dev_dbg(host->dev, "count: %08x, flags %08x\n", count, data->flags);
 
 	if (data->flags & MMC_DATA_READ) {
 		ioread16_rep(host->regs + SDHC_DATA16_FIFO_PORT, buf,
@@ -176,129 +174,201 @@ static irqreturn_t ctr_sdhc_thread_irq(int irq, void *dev_id)
 
 	sg_miter->consumed = count;
 	sg_miter_stop(sg_miter);
-
-done:
-	spin_unlock_irqrestore(&host->lock, flags);
-	return IRQ_HANDLED;
+	/* advance through the scattergather list */
 }
 
-static void ctr_sdhc_respend_irq(struct ctr_sdhc *host)
+static void ctr_sdhc_respend_irq(struct ctr_sdhc *host, u32 irqstat)
 {
-	u32 response[4], *respbuf;
-	struct mmc_command *cmd = host->cmd;
+	struct mmc_command *cmd = host->mrq->cmd;
 
-	if (!host->cmd) {
-		dev_err(host->dev, "Spurious CMD irq\n");
+	if (!(irqstat & SDHC_STAT_CMDRESPEND))
+		return;
+
+	if (!cmd) {
+		dev_err(host->dev, "spurious CMD IRQ: got end of response "
+			"but no command is active\n");
 		return;
 	}
 
-	respbuf = (u32*)cmd->resp;
-	host->cmd = NULL;
+	if (cmd->flags & MMC_RSP_PRESENT) {
+		/* read all 4 words each time */
+		u32 response[4], *resp;
+		ctr_sdhc_get_resp(host, response, 4);
 
-	ctr_sdhc_get_resp(host, response, 4);
+		resp = cmd->resp;
 
-	if (cmd->flags & MMC_RSP_PRESENT && cmd->flags & MMC_RSP_136) {
-		respbuf[0] = (response[3] << 8) | (response[2] >> 24);
-		respbuf[1] = (response[2] << 8) | (response[1] >> 24);
-		respbuf[2] = (response[1] << 8) | (response[0] >> 24);
-		respbuf[3] = response[0] << 8;
-	} else if (cmd->flags & MMC_RSP_PRESENT) {
-		respbuf[0] = response[0];
+		if (cmd->flags & MMC_RSP_136) { /* 136bit response, fill 32 */
+			resp[0] = (response[3] << 8) | (response[2] >> 24);
+			resp[1] = (response[2] << 8) | (response[1] >> 24);
+			resp[2] = (response[1] << 8) | (response[0] >> 24);
+			resp[3] = response[0] << 8;
+		} else { /* plain 32 bit response */
+			resp[0] = response[0];
+		}
 	}
 
-	dev_dbg(host->dev, "Command IRQ complete %d %d %x\n", cmd->opcode,
+	dev_dbg(host->dev, "command IRQ complete %d %d %x\n", cmd->opcode,
 		cmd->error, cmd->flags);
 
-	/* If there is data to handle we will
-	 * finish the request in the data end irq handler.*/
-	if (host->data)
+	/* finish the request in the data handler if there is any */
+	if (host->mrq->data)
 		return;
 
-	ctr_sdhc_finish_request(host);
+	ctr_sdhc_finish_request(host, 0);
 }
 
-static irqreturn_t ctr_sdhc_irq(int irq, void *dev_id)
+static int ctr_sdhc_card_hotplug_irq(struct ctr_sdhc *host, u32 stat)
 {
-	struct ctr_sdhc *host = dev_id;
-	u32 int_reg;
+	u32 mask = stat & (SDHC_STAT_CARDREMOVE | SDHC_STAT_CARDINSERT);
 
+	if (likely(!mask))
+		return 0;
+
+	/* full hardware block reset on hotswap */
+	ctr_sdhc_reset(host);
+
+	/* finish any active requests with a no media error if necessary */
+	if (!(stat & SDHC_STAT_CARDPRESENT))
+		ctr_sdhc_finish_request(host, -ENOMEDIUM);
+
+	mmc_detect_change(host->mmc, 1);
+	return 1;
+}
+
+static irqreturn_t ctr_sdhc_irq_thread(int irq, void *data)
+{
+	u32 irqstat;
+	struct ctr_sdhc *host = data;
 	int error = 0, ret = IRQ_HANDLED;
 
-	spin_lock(&host->lock);
+	mutex_lock(&host->lock);
 
-	int_reg = ctr_sdhc_irqstat_get(host);
-	dev_dbg(host->dev, "IRQ status: %x\n", int_reg);
+	irqstat = ctr_sdhc_irqstat_get(host);
+	dev_dbg(host->dev, "IRQ status: %x\n", irqstat);
 
-	if (!int_reg) {
+	if (!(irqstat & SDHC_IRQMASK)) {
 		ret = IRQ_NONE;
 		goto irq_end;
 	}
 
-	ctr_sdhc_irqstat_ack(host, int_reg & SDHC_DEFAULT_IRQMASK);
+	/* immediately acknowledge any pending IRQs */
+	ctr_sdhc_irqstat_ack(host, irqstat & SDHC_IRQMASK);
 
-	if (int_reg & (SDHC_STAT_CARDREMOVE | SDHC_STAT_CARDINSERT)) {
-		if (int_reg & SDHC_STAT_CARDPRESENT)
-			ctr_sdhc_reset(host, SDHC_DEFAULT_IRQMASK);
-		mmc_detect_change(host->mmc, 1);
-	}
+	/* handle any pending hotplug events */
+	if (ctr_sdhc_card_hotplug_irq(host, irqstat))
+		goto irq_end;
 
-	if (int_reg & SDHC_ERR_CMD_TIMEOUT) {
+	/* skip the command/data events when there's no active request */
+	if (unlikely(host->mrq == NULL))
+		goto irq_end;
+
+	if (irqstat & SDHC_ERR_CMD_TIMEOUT) {
 		error = -ETIMEDOUT;
-	} else if (int_reg & SDHC_ERR_CRC_FAIL) {
+	} else if (irqstat & SDHC_ERR_CRC_FAIL) {
 		error = -EILSEQ;
-	} else if (int_reg & SDHC_ERR_MASK) {
+	} else if (irqstat & SDHC_ERR_MASK) {
 		dev_err(host->dev, "buffer error: %08X\n",
-			int_reg & SDHC_ERR_MASK);
+			irqstat & SDHC_ERR_MASK);
 		/*dev_err(host->dev, "detail error status %08X\n",
 			ioread32(host->regs + SDHC_ERROR_STATUS));*/
 		error = -EIO;
 	}
 
 	if (error) {
-		if (host->cmd)
-			host->cmd->error = error;
+		/* error during transfer */
+		struct mmc_command *cmd = host->mrq->cmd;
+		if (cmd)
+			cmd->error = error;
 
 		if (error != -ETIMEDOUT) {
-			ctr_sdhc_reset(host, SDHC_DEFAULT_IRQMASK);
-			__ctr_sdhc_set_ios(host->mmc, &host->mmc->ios);
+			/* serious error, reset the hardware */
+			ctr_sdhc_reset(host);
+			__ctr_sdhc_set_ios(host, &host->mmc->ios);
 			goto irq_end;
 		}
 	}
 
-	if (int_reg & (SDHC_STAT_RX_READY | SDHC_STAT_TX_REQUEST)) {
-		ret = IRQ_WAKE_THREAD;
-		goto irq_end;
-	}
-
-	if (int_reg & SDHC_STAT_CMDRESPEND)
-		ctr_sdhc_respend_irq(host);
-
-	if (int_reg & SDHC_STAT_DATA_END)
-		ctr_sdhc_data_end_irq(host);
+	ctr_sdhc_data_irq(host, irqstat);
+	ctr_sdhc_respend_irq(host, irqstat);
+	ctr_sdhc_dataend_irq(host, irqstat);
 
 irq_end:
-	spin_unlock(&host->lock);
+	mutex_unlock(&host->lock);
 	return ret;
 }
 
-static irqreturn_t ctr_sdhc_sdio_irq(int irq, void *data)
+
+/** Set clock and power state */
+static void ctr_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 {
-	struct ctr_sdhc *host = data;
-	if (ctr_sdhc_sdioirq_test(host)) {
-		mmc_signal_sdio_irq(host->mmc);
-		return IRQ_HANDLED;
-	}
-	return IRQ_NONE;
+	struct ctr_sdhc *host = mmc_priv(mmc);
+
+	mutex_lock(&host->lock);
+	__ctr_sdhc_set_ios(host, ios);
+	mutex_unlock(&host->lock);
 }
 
-static void ctr_sdhc_start_cmd(struct ctr_sdhc *host, struct mmc_command *cmd)
+
+/** Write-Protect & Card Detect handling */
+static int ctr_sdhc_get_ro(struct mmc_host *mmc)
 {
-	struct mmc_data *data = host->data;
+	int stat;
+	struct ctr_sdhc *host = mmc_priv(mmc);
+	mutex_lock(&host->lock);
+	stat = !(ctr_sdhc_irqstat_get(host) & SDHC_STAT_WRITEPROT);
+	mutex_unlock(&host->lock);
+	return stat;
+}
+
+static int __ctr_sdhc_get_cd(struct ctr_sdhc *host)
+{
+	return !!(ctr_sdhc_irqstat_get(host) & SDHC_STAT_CARDPRESENT);
+}
+
+static int ctr_sdhc_get_cd(struct mmc_host *mmc)
+{
+	int stat;
+	struct ctr_sdhc *host = mmc_priv(mmc);
+	mutex_lock(&host->lock);
+	stat = __ctr_sdhc_get_cd(host);
+	mutex_unlock(&host->lock);
+	return stat;
+}
+
+
+/** Data and command request issuing */
+static void ctr_sdhc_start_data(struct ctr_sdhc *host, struct mmc_data *data)
+{
+	unsigned int flags = 0;
+
+	if (!data)
+		return;
+
+	dev_dbg(host->dev,
+		"setup data transfer: blocksize %08x "
+		"nr_blocks %d, offset: %08x\n",
+		data->blksz, data->blocks, data->sg->offset);
+
+	if (data->flags & MMC_DATA_READ)
+		flags |= SG_MITER_TO_SG;
+	else
+		flags |= SG_MITER_FROM_SG;
+
+	sg_miter_start(&host->sg_miter, data->sg, data->sg_len, flags);
+	ctr_sdhc_set_blk_len_cnt(host, data->blksz, data->blocks);
+}
+
+static void ctr_sdhc_start_cmd(struct ctr_sdhc *host, struct mmc_command *cmd,
+			       struct mmc_data *data)
+{
 	int c = cmd->opcode;
 
-	dev_dbg(host->dev, "Command opcode: %d\n", cmd->opcode);
-
-	if (cmd->opcode == MMC_STOP_TRANSMISSION) {
+	if (c == MMC_STOP_TRANSMISSION) {
+		/*
+		 * the hardware supports automatically issuing a
+		 * STOP_TRANSMISSION command, so do it and
+		 * fake the response to make it look fine
+		 */
 		ctr_sdhc_stop_internal_set(host, SDHC_STOP_INTERNAL_ISSUE);
 
 		cmd->resp[0] = cmd->opcode;
@@ -306,7 +376,7 @@ static void ctr_sdhc_start_cmd(struct ctr_sdhc *host, struct mmc_command *cmd)
 		cmd->resp[2] = 0;
 		cmd->resp[3] = 0;
 
-		ctr_sdhc_finish_request(host);
+		ctr_sdhc_finish_request(host, 0);
 		return;
 	}
 
@@ -326,36 +396,36 @@ static void ctr_sdhc_start_cmd(struct ctr_sdhc *host, struct mmc_command *cmd)
 	case MMC_RSP_R3:
 		c |= SDHC_CMDRSP_R3;
 		break;
-
 	default:
 		dev_err(host->dev, "Unknown response type %d\n",
 			mmc_resp_type(cmd));
 		break;
 	}
 
-	host->cmd = cmd;
-
-	if (cmd->opcode == SD_IO_RW_EXTENDED)
+	/* handle SDIO and APP_CMD cmd bits */
+	switch(cmd->opcode) {
+	case SD_IO_RW_EXTENDED:
+	case SD_IO_RW_DIRECT:
 		c |= SDHC_CMD_SECURE;
-
-	if (cmd->opcode == SD_IO_RW_DIRECT)
-		c |= SDHC_CMD_SECURE;
-
-	if (cmd->opcode == MMC_APP_CMD)
+		break;
+	case MMC_APP_CMD:
 		c |= SDHC_CMDTYPE_APP;
-
-	if (cmd->opcode == MMC_GO_IDLE_STATE)
+		break;
+	case MMC_GO_IDLE_STATE:
 		c |= SDHC_CMDRSP_NONE;
+		break;
+	default:
+		break;
+	}
 
 	if (data) {
+		/* handle data transfers if present */
 		c |= SDHC_CMD_DATA_XFER;
 
-		if (data->blocks > 0) {
+		if (data->blocks > 1) {
 			ctr_sdhc_stop_internal_set(host,
 				SDHC_STOP_INTERNAL_ENABLE);
 			c |= SDHC_CMD_DATA_MULTI;
-		} else {
-			ctr_sdhc_stop_internal_set(host, 0);
 		}
 
 		if (data->flags & MMC_DATA_READ)
@@ -365,80 +435,50 @@ static void ctr_sdhc_start_cmd(struct ctr_sdhc *host, struct mmc_command *cmd)
 	ctr_sdhc_send_cmdarg(host, c, cmd->arg);
 }
 
-static void ctr_sdhc_start_data(struct ctr_sdhc *host, struct mmc_data *data)
-{
-	unsigned int flags = SG_MITER_ATOMIC;
-
-	dev_dbg(host->dev,
-		"setup data transfer: blocksize %08x "
-		"nr_blocks %d, offset: %08x\n",
-		data->blksz, data->blocks, data->sg->offset);
-
-	host->data = data;
-
-	if (data->flags & MMC_DATA_READ)
-		flags |= SG_MITER_TO_SG;
-	else
-		flags |= SG_MITER_FROM_SG;
-
-	sg_miter_start(&host->sg_miter, data->sg, data->sg_len, flags);
-
-	ctr_sdhc_set_blk_len_cnt(host, data->blksz, data->blocks);
-}
-
-/* Process requests from the MMC layer */
 static void ctr_sdhc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 {
 	struct ctr_sdhc *host = mmc_priv(mmc);
-	unsigned long flags;
 
-	if (!(ioread16(host->regs + SDHC_IRQ_STAT) & SDHC_STAT_CARDPRESENT)) {
+	mutex_lock(&host->lock);
+
+	if (!__ctr_sdhc_get_cd(host)) {
+		/* card not present, immediately return an error */
 		mrq->cmd->error = -ENOMEDIUM;
 		mmc_request_done(mmc, mrq);
-		return;
-	}
+	} else {
+		/* card available, begin request */
+		WARN_ON(host->mrq != NULL);
+		/* warn if there's another live transfer */
 
-	spin_lock_irqsave(&host->lock, flags);
-
-	WARN_ON(host->mrq != NULL);
-
-	host->mrq = mrq;
-
-	if (mrq->data)
+		host->mrq = mrq;
 		ctr_sdhc_start_data(host, mrq->data);
-
-	ctr_sdhc_start_cmd(host, mrq->cmd);
-
-	spin_unlock_irqrestore(&host->lock, flags);
+		ctr_sdhc_start_cmd(host, mrq->cmd, mrq->data);
+	}
+	mutex_unlock(&host->lock);
 }
 
-static void ctr_sdhc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
-{
-	struct ctr_sdhc *host = mmc_priv(mmc);
-	unsigned long flags;
 
-	spin_lock_irqsave(&host->lock, flags);
-	__ctr_sdhc_set_ios(mmc, ios);
-	spin_unlock_irqrestore(&host->lock, flags);
-}
-
-static int ctr_sdhc_get_ro(struct mmc_host *mmc)
+/* SDIO IRQ support */
+static irqreturn_t ctr_sdhc_sdio_irq_thread(int irq, void *data)
 {
-	struct ctr_sdhc *host = mmc_priv(mmc);
-	return !(ctr_sdhc_irqstat_get(host) & SDHC_STAT_WRITEPROT);
-}
+	irqreturn_t ret = IRQ_NONE;
+	struct ctr_sdhc *host = data;
 
-static int ctr_sdhc_get_cd(struct mmc_host *mmc)
-{
-	struct ctr_sdhc *host = mmc_priv(mmc);
-	return !!(ctr_sdhc_irqstat_get(host) & SDHC_STAT_CARDPRESENT);
+	mutex_lock(&host->lock);
+	if (ctr_sdhc_sdioirq_test(host)) {
+		mmc_signal_sdio_irq(host->mmc);
+		ret = IRQ_HANDLED;
+	}
+	mutex_unlock(&host->lock);
+	return ret;
 }
 
 static void ctr_sdhc_enable_sdio_irq(struct mmc_host *mmc, int enable)
 {
 	struct ctr_sdhc *host = mmc_priv(mmc);
-	pr_err("ctr_sdhc_enable_sdio_irq %d\n", enable);
+	mutex_lock(&host->lock);
 	ctr_sdhc_sdioirq_set(host, enable);
+	mutex_unlock(&host->lock);
 }
 
 static const struct mmc_host_ops ctr_sdhc_ops = {
@@ -448,23 +488,6 @@ static const struct mmc_host_ops ctr_sdhc_ops = {
 	.get_cd = ctr_sdhc_get_cd,
 	.enable_sdio_irq = ctr_sdhc_enable_sdio_irq,
 };
-
-#ifdef CONFIG_PM_SLEEP
-static int ctr_sdhc_pm_suspend(struct device *dev)
-{
-	struct ctr_sdhc *host = dev_get_drvdata(dev);
-	ctr_sdhc_irqmask_set(host, ~0);
-	ctr_sdhc_set_clk_opt(host, 0, SDHC_CARD_OPTION_1BIT);
-	return 0;
-}
-
-static int ctr_sdhc_pm_resume(struct device *dev)
-{
-	struct ctr_sdhc *host = dev_get_drvdata(dev);
-	ctr_sdhc_reset(host, SDHC_DEFAULT_IRQMASK);
-	return 0;
-}
-#endif /* CONFIG_PM_SLEEP */
 
 static int ctr_sdhc_probe(struct platform_device *pdev)
 {
@@ -478,13 +501,18 @@ static int ctr_sdhc_probe(struct platform_device *pdev)
 	dev = &pdev->dev;
 
 	sdclk = devm_clk_get(dev, NULL);
-	if (IS_ERR(sdclk))
+	if (IS_ERR(sdclk)) {
+		pr_err("no clock provided\n");
 		return PTR_ERR(sdclk);
+	}
 
 	ret = clk_prepare_enable(sdclk);
 	if (ret)
 		return ret;
+
 	clkrate = clk_get_rate(sdclk);
+	if (!clkrate)
+		return -EINVAL;
 
 	mmc = mmc_alloc_host(sizeof(struct ctr_sdhc), dev);
 	if (!mmc)
@@ -506,25 +534,32 @@ static int ctr_sdhc_probe(struct platform_device *pdev)
 	mmc->ops = &ctr_sdhc_ops;
 	mmc->caps = MMC_CAP_4_BIT_DATA | MMC_CAP_MMC_HIGHSPEED |
 		    MMC_CAP_SD_HIGHSPEED | MMC_CAP_SDIO_IRQ;
+	mmc->caps2 = MMC_CAP2_NO_SDIO | MMC_CAP2_NO_MMC;
 	mmc->ocr_avail = MMC_VDD_32_33;
+
 	mmc->max_blk_size = 0x200;
 	mmc->max_blk_count = 0xFFFF;
 
-	mmc->f_min = clkrate >> 9;
-	mmc->f_max = clkrate >> 1;
+	mmc->f_max = clkrate / 2;
+	mmc->f_min = clkrate / 512;
 
-	spin_lock_init(&host->lock);
+	mmc->max_segs = 1;
+	mmc->max_seg_size = mmc->max_blk_size * mmc->max_blk_count;
+	mmc->max_req_size = mmc->max_blk_size * mmc->max_blk_count;
 
-	ctr_sdhc_reset(host, SDHC_DEFAULT_IRQMASK);
+	mutex_init(&host->lock);
+
+	ctr_sdhc_reset(host);
 
 	ret = devm_request_threaded_irq(dev, platform_get_irq(pdev, 0),
-					ctr_sdhc_irq, ctr_sdhc_thread_irq,
-					IRQF_SHARED, DRIVER_NAME, host);
+					NULL, ctr_sdhc_irq_thread,
+					IRQF_ONESHOT, dev_name(dev), host);
 	if (ret)
 		goto free_mmc;
 
-	ret = devm_request_irq(dev, platform_get_irq(pdev, 1),
-			       ctr_sdhc_sdio_irq, 0, DRIVER_NAME, host);
+	ret = devm_request_threaded_irq(dev, platform_get_irq(pdev, 1),
+					NULL, ctr_sdhc_sdio_irq_thread,
+					IRQF_ONESHOT, dev_name(dev), host);
 	if (ret)
 		goto free_mmc;
 
@@ -537,15 +572,6 @@ free_mmc:
 	return ret;
 }
 
-static int ctr_sdhc_remove(struct platform_device *pdev)
-{
-	return -EBUSY;
-}
-
-static const struct dev_pm_ops ctr_sdhc_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(ctr_sdhc_pm_suspend, ctr_sdhc_pm_resume)
-};
-
 static const struct of_device_id ctr_sdhc_of_match[] = {
 	{ .compatible = "nintendo," DRIVER_NAME },
 	{},
@@ -554,13 +580,11 @@ MODULE_DEVICE_TABLE(of, ctr_sdhc_of_match);
 
 static struct platform_driver ctr_sdhc_driver = {
 	.probe = ctr_sdhc_probe,
-	.remove = ctr_sdhc_remove,
 
 	.driver = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
 		.of_match_table = of_match_ptr(ctr_sdhc_of_match),
-		.pm = &ctr_sdhc_pm_ops
 	},
 };
 

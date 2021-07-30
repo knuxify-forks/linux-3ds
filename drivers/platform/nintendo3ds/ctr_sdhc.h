@@ -8,6 +8,32 @@
 #ifndef CTR_SDHC_H
 #define CTR_SDHC_H
 
+struct ctr_sdhc;
+
+/*
+ * SD hardware abstraction of sorts: there can be separate MMIO and PXI
+ * implementations, but they *must* support these operations.
+ */
+static u16 ctr_sdhc_reg16_get(struct ctr_sdhc *host, unsigned off);
+static void ctr_sdhc_reg16_set(struct ctr_sdhc *host, unsigned off, u16 val);
+static u32 ctr_sdhc_reg32_get(struct ctr_sdhc *host, unsigned off);
+static void ctr_sdhc_reg32_set(struct ctr_sdhc *host, unsigned off, u32 val);
+
+static void ctr_sdhc_reset(struct ctr_sdhc *host);
+static void ctr_sdhc_set_clk_opt(struct ctr_sdhc *host, u16 clk, u16 opt);
+
+static void ctr_sdhc_send_cmdarg(struct ctr_sdhc *host, u16 cmd, u32 arg);
+static void ctr_sdhc_set_blk_len_cnt(struct ctr_sdhc *host, u16 len, u16 cnt);
+static void ctr_sdhc_get_resp(struct ctr_sdhc *host, u32 *resp, unsigned n);
+static void ctr_sdhc_stop_internal_set(struct ctr_sdhc *host, u16 val);
+
+static u32 ctr_sdhc_irqstat_get(struct ctr_sdhc *host);
+static void ctr_sdhc_irqstat_ack(struct ctr_sdhc *host, u32 ack);
+static void ctr_sdhc_irqmask_set(struct ctr_sdhc *host, u32 mask);
+
+static int ctr_sdhc_sdioirq_test(struct ctr_sdhc *host);
+static void ctr_sdhc_sdioirq_set(struct ctr_sdhc *host, int enable);
+
 /*
  * SD CMD flags
  */
@@ -135,15 +161,13 @@ struct ctr_sdhc {
 	struct device *dev;
 	void __iomem *regs;
 
+	struct mutex lock;
+
 	struct mmc_host *mmc;
 	struct clk *sdclk;
 
-	spinlock_t lock;
-
+	/* transfer being handled */
 	struct mmc_request *mrq;
-	struct mmc_command *cmd;
-	struct mmc_data *data;
-
 	struct sg_mapping_iter sg_miter;
 };
 

@@ -7,7 +7,7 @@
 
 #include "ctr_sdhc.c"
 
-/* very basic primitives */
+/* basic primitives */
 static u16 ctr_sdhc_reg16_get(struct ctr_sdhc *host, unsigned off)
 {
 	return ioread16(host->regs + off);
@@ -29,7 +29,7 @@ static void ctr_sdhc_reg32_set(struct ctr_sdhc *host, unsigned off, u32 val)
 }
 
 /* slightly more sdhc-related stuff */
-static void ctr_sdhc_reset(struct ctr_sdhc *host, u32 default_irqmask)
+static void ctr_sdhc_reset(struct ctr_sdhc *host)
 {
 	/* reset controller */
 	ctr_sdhc_reg16_set(host, SDHC_SOFTRESET, 0);
@@ -52,11 +52,10 @@ static void ctr_sdhc_reset(struct ctr_sdhc *host, u32 default_irqmask)
 	ctr_sdhc_reg16_set(host, SDHC_DATA32_CTL, 0);
 
 	/* set interrupt masks */
-	ctr_sdhc_reg32_set(host, SDHC_IRQ_MASK, ~default_irqmask);
+	ctr_sdhc_reg32_set(host, SDHC_IRQ_MASK, ~SDHC_IRQMASK);
 	ctr_sdhc_reg32_set(host, SDHC_IRQ_STAT, 0);
 
-	ctr_sdhc_reg16_set(host, SDHC_CARD_OPTION, SDHC_CARD_OPTION_1BIT |
-			   SDHC_CARD_OPTION_NOC2);
+	ctr_sdhc_reg16_set(host, SDHC_CARD_OPTION, SDHC_DEFAULT_CARDOPT);
 }
 
 static void ctr_sdhc_set_clk_opt(struct ctr_sdhc *host, u16 clk, u16 opt)
@@ -77,10 +76,10 @@ static void ctr_sdhc_set_blk_len_cnt(struct ctr_sdhc *host, u16 len, u16 cnt)
 	ctr_sdhc_reg16_set(host, SDHC_DATA16_BLK_CNT, cnt);
 }
 
-static void ctr_sdhc_get_resp(struct ctr_sdhc *host, u32 *resp, unsigned nword)
+static void ctr_sdhc_get_resp(struct ctr_sdhc *host, u32 *resp, unsigned n)
 {
 	int i;
-	for (i = 0; i < nword; i++)
+	for (i = 0; i < n; i++)
 		resp[i] = ctr_sdhc_reg32_get(host, SDHC_CMD_RESPONSE + (i * 4));
 }
 
