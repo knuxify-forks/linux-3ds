@@ -33,9 +33,9 @@
 	 SDHC_ERR_DATATIMEOUT | SDHC_ERR_TX_OVERFLOW | SDHC_ERR_RX_UNDERRUN |  \
 	 SDHC_ERR_CMD_TIMEOUT | SDHC_ERR_ILLEGAL_ACC)
 
-#define SDHC_IRQMASK                                                   \
-	(SDHC_STAT_CMDRESPEND | SDHC_STAT_DATA_END | SDHC_STAT_RX_READY |      \
-	 SDHC_STAT_TX_REQUEST | SDHC_STAT_CARDREMOVE | SDHC_STAT_CARDINSERT |  \
+#define SDHC_IRQMASK \
+	(SDHC_STAT_CMDRESPEND | SDHC_STAT_DATA_END | \
+	 SDHC_STAT_CARDREMOVE | SDHC_STAT_CARDINSERT | \
 	 SDHC_ERR_MASK)
 
 #define SDHC_DEFAULT_CARDOPT	( \
@@ -130,32 +130,29 @@ static void ctr_sdhc_data_irq(struct ctr_sdhc *host, u32 irqstat)
 {
 	u8 *buf;
 	int count;
+	u32 data32_irq;
 	struct mmc_data *data;
 	struct sg_mapping_iter *sg_miter;
-
-	u32 mask = irqstat & (SDHC_STAT_RX_READY | SDHC_STAT_TX_REQUEST);
-	if (!mask)
-		return;
 
 	/* data available to be sent or received */
 	data = host->mrq->data;
 	sg_miter = &host->sg_miter;
 
-	if (!data) {
-		dev_err(host->dev,
-			"spurious data IRQ: request carries no data\n");
-		/* break out with an IO error in case there's
-		 * a FIFO interrupt without a data transfer */
-		data->error = -EIO;
-		ctr_sdhc_finish_request(host, -EIO);
+	if (!data)
 		return;
+
+	data32_irq = ctr_sdhc_reg16_get(host, SDHC_DATA32_CTL);
+	if (data->flags & MMC_DATA_READ) {
+		if (!(data32_irq & SDHC_DATA32_CTL_RXRDY_PENDING))
+			return;
+	} else {
+		if (data32_irq & SDHC_DATA32_CTL_NTXRQ_PENDING)
+			return;
 	}
 
-	/* no pending blocks, warn out */
-	if (!sg_miter_next(sg_miter)) {
-		dev_err(host->dev, "spurious data IRQ: no pending blocks\n");
+	/* no pending blocks, quit */
+	if (!sg_miter_next(sg_miter))
 		return;
-	}
 
 	buf = sg_miter->addr;
 
@@ -165,11 +162,11 @@ static void ctr_sdhc_data_irq(struct ctr_sdhc *host, u32 irqstat)
 		count = data->blksz;
 
 	if (data->flags & MMC_DATA_READ) {
-		ioread16_rep(host->regs + SDHC_DATA16_FIFO_PORT, buf,
-			     count >> 1);
+		ioread32_rep(host->fifo_port, buf,
+			     count >> 2);
 	} else {
-		iowrite16_rep(host->regs + SDHC_DATA16_FIFO_PORT, buf,
-			      count >> 1);
+		iowrite32_rep(host->fifo_port, buf,
+			      count >> 2);
 	}
 
 	sg_miter->consumed = count;
@@ -246,12 +243,7 @@ static irqreturn_t ctr_sdhc_irq_thread(int irq, void *data)
 	irqstat = ctr_sdhc_irqstat_get(host);
 	dev_dbg(host->dev, "IRQ status: %x\n", irqstat);
 
-	if (!(irqstat & SDHC_IRQMASK)) {
-		ret = IRQ_NONE;
-		goto irq_end;
-	}
-
-	/* immediately acknowledge any pending IRQs */
+	/* immediately acknowledge all pending IRQs */
 	ctr_sdhc_irqstat_ack(host, irqstat & SDHC_IRQMASK);
 
 	/* handle any pending hotplug events */
@@ -492,6 +484,7 @@ static const struct mmc_host_ops ctr_sdhc_ops = {
 static int ctr_sdhc_probe(struct platform_device *pdev)
 {
 	int ret;
+	u32 fifo_addr;
 	struct clk *sdclk;
 	struct device *dev;
 	struct mmc_host *mmc;
@@ -514,19 +507,29 @@ static int ctr_sdhc_probe(struct platform_device *pdev)
 	if (!clkrate)
 		return -EINVAL;
 
+	if (of_property_read_u32(dev->of_node, "fifo", &fifo_addr))
+		return -EINVAL;
+
 	mmc = mmc_alloc_host(sizeof(struct ctr_sdhc), dev);
 	if (!mmc)
 		return -ENOMEM;
 
 	host = mmc_priv(mmc);
+	platform_set_drvdata(pdev, host);
+
+	/* set up host data */
+	host->dev = dev;
 	host->mmc = mmc;
 	host->sdclk = sdclk;
 
-	host->dev = dev;
-	platform_set_drvdata(pdev, host);
-
 	host->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(host->regs)) {
+		ret = -ENOMEM;
+		goto free_mmc;
+	}
+
+	host->fifo_port = devm_ioremap(dev, fifo_addr, 4);
+	if (!host->fifo_port) {
 		ret = -ENOMEM;
 		goto free_mmc;
 	}

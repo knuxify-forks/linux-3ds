@@ -161,6 +161,8 @@ struct ctr_sdhc {
 	struct device *dev;
 	void __iomem *regs;
 
+	void __iomem *fifo_port;
+
 	struct mutex lock;
 
 	struct mmc_host *mmc;

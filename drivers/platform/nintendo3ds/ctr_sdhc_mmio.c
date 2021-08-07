@@ -47,13 +47,17 @@ static void ctr_sdhc_reset(struct ctr_sdhc *host)
 	ctr_sdhc_reg16_set(host, SDHC_DATA32_BLK_CNT, 0);
 	ctr_sdhc_reg16_set(host, SDHC_DATA32_BLK_LEN, 0);
 
-	/* use the 16bit FIFO at all times */
-	ctr_sdhc_reg16_set(host, SDHC_DATA_CTL, 0);
-	ctr_sdhc_reg16_set(host, SDHC_DATA32_CTL, 0);
+	/* use the 32bit FIFO at all times */
+	ctr_sdhc_reg16_set(host, SDHC_DATA_CTL, SDHC_DATA_CTL_WORD_FIFO_EN);
+	ctr_sdhc_reg16_set(host, SDHC_DATA32_CTL,
+			   SDHC_DATA32_CTL_WORD_FIFO_EN |
+			   SDHC_DATA32_CTL_WORD_FIFO_CLR |
+			   SDHC_DATA32_CTL_RXRDY_IRQEN |
+			   SDHC_DATA32_CTL_TXRQ_IRQEN);
 
 	/* set interrupt masks */
 	ctr_sdhc_reg32_set(host, SDHC_IRQ_MASK, ~SDHC_IRQMASK);
-	ctr_sdhc_reg32_set(host, SDHC_IRQ_STAT, 0);
+	ctr_sdhc_reg32_set(host, SDHC_IRQ_STAT, ~SDHC_IRQMASK);
 
 	ctr_sdhc_reg16_set(host, SDHC_CARD_OPTION, SDHC_DEFAULT_CARDOPT);
 }
@@ -74,6 +78,9 @@ static void ctr_sdhc_set_blk_len_cnt(struct ctr_sdhc *host, u16 len, u16 cnt)
 {
 	ctr_sdhc_reg16_set(host, SDHC_DATA16_BLK_LEN, len);
 	ctr_sdhc_reg16_set(host, SDHC_DATA16_BLK_CNT, cnt);
+
+	ctr_sdhc_reg16_set(host, SDHC_DATA32_BLK_LEN, len);
+	ctr_sdhc_reg16_set(host, SDHC_DATA32_BLK_CNT, cnt);
 }
 
 static void ctr_sdhc_get_resp(struct ctr_sdhc *host, u32 *resp, unsigned n)
