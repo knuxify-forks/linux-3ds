@@ -30,8 +30,10 @@
 		sdcard: sdhc-controller@10100000 {
 			compatible = "nintendo,3ds-sdhc";
 			reg = <0x10100000 0x200>;
+			fifo-addr = <0x10300000>;
 
-			fifo = <0x10300000>;
+			dmas = <&cdma 5>;
+			dma-names = "fifo";
 
 			interrupts =
 				<GIC_SPI 0x22 IRQ_TYPE_EDGE_RISING>,
@@ -66,8 +68,10 @@
 		nwm: sdhc-controller@10122000 {
 			compatible = "nintendo,3ds-sdhc";
 			reg = <0x10122000 0x200>;
+			fifo-addr = <0x10322000>;
 
-			fifo = <0x10322000>;
+			dmas = <&cdma 4>;
+			dma-names = "fifo";
 
 			interrupts =
 				<GIC_SPI 0x20 IRQ_TYPE_EDGE_RISING>,
