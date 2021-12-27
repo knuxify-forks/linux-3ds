@@ -11,7 +11,6 @@
 static irqreturn_t pxi_sync_thread(int irq, void *data)
 {
 	int err;
-	u32 pend;
 	irqreturn_t ret = IRQ_NONE;
 	struct ctr_pxi_host *pxi = data;
 
@@ -20,13 +19,14 @@ static irqreturn_t pxi_sync_thread(int irq, void *data)
 
 	mutex_lock(&pxi->irq_lock);
 	do { /* keep requesting the highest priority IRQ until there's none */
-		err = pxi_cmd_one(pxi, ctr_pxi_cmd_irqget, &pend);
+		u32 pending;
+		err = pxi_cmd_one(pxi, ctr_pxi_cmd_irqget, &pending);
 
-		if (pend >= CTR_PXI_NR_IRQS)
+		if (pending >= CTR_PXI_NR_IRQS)
 			break;
 
 		ret = IRQ_HANDLED;
-		generic_handle_irq(irq_find_mapping(pxi->irqdom, pend));
+		generic_handle_irq(irq_find_mapping(pxi->irqdom, pending));
 	} while(1);
 	mutex_unlock(&pxi->irq_lock);
 

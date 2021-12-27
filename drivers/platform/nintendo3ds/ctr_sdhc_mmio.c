@@ -13,9 +13,10 @@ static u16 ctr_sdhc_reg16_get(struct ctr_sdhc *host, unsigned off)
 	return ioread16(host->regs + off);
 }
 
-static void ctr_sdhc_reg16_set(struct ctr_sdhc *host, unsigned off, u16 val)
+static int ctr_sdhc_reg16_set(struct ctr_sdhc *host, unsigned off, u16 val)
 {
 	iowrite16(val, host->regs + off);
+	return 0;
 }
 
 static u32 ctr_sdhc_reg32_get(struct ctr_sdhc *host, unsigned off)
@@ -23,13 +24,14 @@ static u32 ctr_sdhc_reg32_get(struct ctr_sdhc *host, unsigned off)
 	return ioread32(host->regs + off);
 }
 
-static void ctr_sdhc_reg32_set(struct ctr_sdhc *host, unsigned off, u32 val)
+static int ctr_sdhc_reg32_set(struct ctr_sdhc *host, unsigned off, u32 val)
 {
 	iowrite32(val, host->regs + off);
+	return 0;
 }
 
 /* slightly more sdhc-related stuff */
-static void ctr_sdhc_reset(struct ctr_sdhc *host)
+static int ctr_sdhc_reset(struct ctr_sdhc *host)
 {
 	/* reset controller */
 	ctr_sdhc_reg16_set(host, SDHC_SOFTRESET, 0);
@@ -51,48 +53,52 @@ static void ctr_sdhc_reset(struct ctr_sdhc *host)
 	ctr_sdhc_reg16_set(host, SDHC_DATA_CTL, SDHC_DATA_CTL_WORD_FIFO_EN);
 	ctr_sdhc_reg16_set(host, SDHC_DATA32_CTL,
 			   SDHC_DATA32_CTL_WORD_FIFO_EN |
-			   SDHC_DATA32_CTL_WORD_FIFO_CLR |
-			   SDHC_DATA32_CTL_RXRDY_IRQEN |
-			   SDHC_DATA32_CTL_TXRQ_IRQEN);
+			   SDHC_DATA32_CTL_WORD_FIFO_CLR);
 
 	/* set interrupt masks */
 	ctr_sdhc_reg32_set(host, SDHC_IRQ_MASK, ~SDHC_IRQMASK);
 	ctr_sdhc_reg32_set(host, SDHC_IRQ_STAT, ~SDHC_IRQMASK);
 
 	ctr_sdhc_reg16_set(host, SDHC_CARD_OPTION, SDHC_DEFAULT_CARDOPT);
+	return 0;
 }
 
-static void ctr_sdhc_set_clk_opt(struct ctr_sdhc *host, u16 clk, u16 opt)
+static int ctr_sdhc_set_clk_opt(struct ctr_sdhc *host, u16 clk, u16 opt)
 {
 	ctr_sdhc_reg16_set(host, SDHC_CARD_CLKCTL, clk);
 	ctr_sdhc_reg16_set(host, SDHC_CARD_OPTION, opt);
+	return 0;
 }
 
-static void ctr_sdhc_send_cmdarg(struct ctr_sdhc *host, u16 cmd, u32 arg)
+static int ctr_sdhc_send_cmdarg(struct ctr_sdhc *host, u16 cmd, u32 arg)
 {
 	ctr_sdhc_reg32_set(host, SDHC_CMD_PARAM, arg);
 	ctr_sdhc_reg16_set(host, SDHC_CMD, cmd);
+	return 0;
 }
 
-static void ctr_sdhc_set_blk_len_cnt(struct ctr_sdhc *host, u16 len, u16 cnt)
+static int ctr_sdhc_set_blk_len_cnt(struct ctr_sdhc *host, u16 len, u16 cnt)
 {
 	ctr_sdhc_reg16_set(host, SDHC_DATA16_BLK_LEN, len);
 	ctr_sdhc_reg16_set(host, SDHC_DATA16_BLK_CNT, cnt);
 
 	ctr_sdhc_reg16_set(host, SDHC_DATA32_BLK_LEN, len);
 	ctr_sdhc_reg16_set(host, SDHC_DATA32_BLK_CNT, cnt);
+	return 0;
 }
 
-static void ctr_sdhc_get_resp(struct ctr_sdhc *host, u32 *resp, unsigned n)
+static int ctr_sdhc_get_resp(struct ctr_sdhc *host, u32 *resp, unsigned n)
 {
 	int i;
 	for (i = 0; i < n; i++)
 		resp[i] = ctr_sdhc_reg32_get(host, SDHC_CMD_RESPONSE + (i * 4));
+	return 0;
 }
 
-static void ctr_sdhc_stop_internal_set(struct ctr_sdhc *host, u16 val)
+static int ctr_sdhc_stop_internal_set(struct ctr_sdhc *host, u16 val)
 {
 	ctr_sdhc_reg16_set(host, SDHC_STOP_INTERNAL, val);
+	return 0;
 }
 
 static u32 ctr_sdhc_irqstat_get(struct ctr_sdhc *host)
@@ -100,14 +106,16 @@ static u32 ctr_sdhc_irqstat_get(struct ctr_sdhc *host)
 	return ctr_sdhc_reg32_get(host, SDHC_IRQ_STAT);
 }
 
-static void ctr_sdhc_irqstat_ack(struct ctr_sdhc *host, u32 ack)
+static int ctr_sdhc_irqstat_ack(struct ctr_sdhc *host, u32 ack)
 {
 	ctr_sdhc_reg32_set(host, SDHC_IRQ_STAT, ~ack);
+	return 0;
 }
 
-static void ctr_sdhc_irqmask_set(struct ctr_sdhc *host, u32 mask)
+static int ctr_sdhc_irqmask_set(struct ctr_sdhc *host, u32 mask)
 {
 	ctr_sdhc_reg32_set(host, SDHC_IRQ_MASK, mask);
+	return 0;
 }
 
 static int ctr_sdhc_sdioirq_test(struct ctr_sdhc *host)
@@ -122,11 +130,13 @@ static int ctr_sdhc_sdioirq_test(struct ctr_sdhc *host)
 	return 0;
 }
 
-static void ctr_sdhc_sdioirq_set(struct ctr_sdhc *host, int enable)
+static int ctr_sdhc_sdioirq_set(struct ctr_sdhc *host, int enable)
 {
 	/* always acknowledge the card interrupts first */
 	ctr_sdhc_reg16_set(host, SDHC_CARD_IRQ_STAT, 0);
 
 	/* either disable all interrupts _except_ SDIO IRQ, or disable all */
 	ctr_sdhc_reg16_set(host, SDHC_CARD_IRQ_MASK, enable ? ~1 : ~0);
+
+	return 0;
 }

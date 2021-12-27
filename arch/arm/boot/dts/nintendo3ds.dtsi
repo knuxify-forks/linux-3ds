@@ -65,7 +65,7 @@
 			no-output;
 		};
 
-		nwm: sdhc-controller@10122000 {
+		/*nwm: sdhc-controller@10122000 {
 			compatible = "nintendo,3ds-sdhc";
 			reg = <0x10122000 0x200>;
 			fifo-addr = <0x10322000>;
@@ -78,7 +78,7 @@
 				<GIC_SPI 0x21 IRQ_TYPE_EDGE_RISING>;
 
 			clocks = <&sdclk>;
-		};
+		};*/
 
 		gpio0: gpio-controller@10147000 {
 			compatible = "nintendo,3ds-gpio";
@@ -385,9 +385,17 @@
 			clock-names = "apb_pclk";
 
 			interrupts =
+				<GIC_SPI 0x10 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 0x11 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 0x12 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 0x13 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 0x14 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 0x15 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 0x16 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 0x17 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 0x18 IRQ_TYPE_LEVEL_HIGH>,
 				<GIC_SPI 0x19 IRQ_TYPE_LEVEL_HIGH>,
-				<GIC_SPI 0x1A IRQ_TYPE_LEVEL_HIGH>,
-				<GIC_SPI 0x1B IRQ_TYPE_LEVEL_HIGH>;
+				<GIC_SPI 0x19 IRQ_TYPE_LEVEL_HIGH>;
 
 			#dma-cells = <1>;
 			#dma-channels = <8>;
